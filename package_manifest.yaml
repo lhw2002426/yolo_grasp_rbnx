@@ -1,0 +1,53 @@
+# yolo_grasp_rbnx — geometric grasp-pose estimator service.
+#
+# Pure CPU. No ML model, no GPU, no torch. Owns
+# `robonix/service/perception/grasp_pose/*`.
+#
+# Three roles:
+#   * SERVER (atlas MCP): grasp_pose/grasp_request — Pilot's new path
+#   * SERVER (legacy ROS): /graspnet/grasp_request + /graspnet/grasps
+#                          — pick.py + C++ piper_moveit_control compat
+#   * CLIENT (legacy ROS): /yolo/detect_object — owned by yolo_world_rbnx
+#                          (will switch to atlas MCP in Stage 6)
+#
+# Lifecycle:
+#   on_init      — light-medium: parse cfg, atlas-resolve detect_object
+#                  endpoint (informational), spawn rclpy thread
+#                  (service host + topic publisher + detect client).
+#   on_deactivate — stop rclpy thread.
+#
+# Capability surface (mode = abstract, transport = wire):
+#   service/perception/grasp_pose/driver         mode=rpc        transport=gRPC  Driver(INIT)
+#   service/perception/grasp_pose/grasp_request  mode=rpc        transport=MCP   GraspRequest.srv
+#   service/perception/grasp_pose/grasps         mode=topic_out  transport=ROS2  GraspPose.msg
+#
+# ⚠️ PLACEHOLDER mode — the real grasp-pose math from upstream
+# `/home/syswonder/lhw/detect_grasp/yolo_grasp.py` has not yet been
+# copied into this package. While IS_PLACEHOLDER=True in main.py,
+# every grasp_request returns success=false with a clear message.
+# See README.md "Placeholder mode" for the cutover steps.
+#
+# Vendored:
+#   src/graspnet_msgs/   (msg + srv) — colcon build for ROS bindings
+#                        (GraspRequest, GraspPose, ObjectDetectionRequest)
+#   yolo_grasp/_upstream/yolo_grasp.py — the placeholder source from
+#                        /Users/howenliu/lab/grasp/detect_grasp/. The
+#                        real implementation will overwrite this file.
+manifestVersion: 1
+
+package:
+  name: com.robonix.piper_grasp.yolo_grasp
+  version: 0.1.0
+  vendor: robonix
+  description: Geometric grasp-pose estimator (atlas + ROS dual surface).
+  license: MulanPSL-2.0
+
+capability_id: yolo_grasp
+
+build: bash scripts/build.sh
+start: bash scripts/start.sh
+
+capabilities:
+  - name: robonix/service/perception/grasp_pose/driver
+  - name: robonix/service/perception/grasp_pose/grasp_request
+  - name: robonix/service/perception/grasp_pose/grasps

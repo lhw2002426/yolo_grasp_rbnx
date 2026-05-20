@@ -1,0 +1,37 @@
+# Compute a grasp pose for a named object. Schema is bytes-compatible
+# with upstream graspnet_msgs/srv/GraspRequest.srv — only the
+# namespace changes (robonix.grasp vs graspnet).
+
+# Request
+string object_name
+
+# 2D bounding box in pixel coords [x_min, y_min, x_max, y_max].
+# May be empty — handler then calls object_detect/detect_object
+# itself to localise the target.
+float64[] bbox_2d
+
+# 3D center hint [x, y, z] meters in camera optical frame.
+# May be empty — handler will back-project from depth+bbox.
+float64[] object_center_3d
+
+# How many times the caller has already retried (lets the handler
+# pick a different grasp candidate on retry instead of returning
+# the same one).
+int32 retry
+---
+# Response
+
+# Grasp pose in camera_color_optical_frame.
+geometry_msgs/PoseStamped grasp_pose
+
+# Gripper opening (m).
+float32 gripper_width
+
+# Quality score (handler-defined heuristic, higher = better).
+float32 score
+
+# Success flag.
+bool success
+
+# Status / error message.
+string message
