@@ -34,17 +34,26 @@ else
     exit 2
 fi
 
-# ── Direct PYTHONPATH / AMENT_PREFIX_PATH injection for graspnet_msgs ──
+# ── Direct PYTHONPATH / AMENT_PREFIX_PATH / LD_LIBRARY_PATH injection ──
 # Why: when this start.sh runs inside an outer shell that already has
 # ANOTHER colcon overlay sourced (e.g. operator's ~/.bashrc sources
 # /home/.../tracing_ws/install/setup.bash), colcon's idempotent prefix
 # markers can cause our `source $PKG/rbnx-build/ws/install/setup.bash`
 # above to silently NOT add our overlay's paths to AMENT_PREFIX_PATH /
-# PYTHONPATH. The package then `import graspnet_msgs.srv` fails despite
-# the build tree being fully populated. We side-step that by computing
-# the two paths the colcon overlay would add for graspnet_msgs and
-# prepending them ourselves, unconditionally. Idempotent — if colcon
-# DID source correctly, the paths are merely duplicated, not corrupted.
+# PYTHONPATH / LD_LIBRARY_PATH. Symptoms in this order as you tighten
+# the fix:
+#
+#   1. `import graspnet_msgs.srv` fails        ← needs PYTHONPATH
+#   2. import OK but rclpy.create_publisher    ← needs LD_LIBRARY_PATH
+#      raises "Could not load library
+#      libgraspnet_msgs__rosidl_typesupport_introspection_c.so"
+#      → rclpy thread CRASHES, RPC stays alive,
+#        package looks ACTIVE but produces nothing
+#   3. [optional] ament_index lookups fail     ← needs AMENT_PREFIX_PATH
+#
+# We inject all three from the `graspnet_msgs` install tree directly,
+# bypassing colcon's idempotent guard. Idempotent — if colcon DID
+# source correctly, the paths are merely duplicated, not corrupted.
 GMSGS_PREFIX="$PKG/rbnx-build/ws/install/graspnet_msgs"
 if [[ -d "$GMSGS_PREFIX" ]]; then
     case ":${AMENT_PREFIX_PATH:-}:" in
@@ -64,6 +73,18 @@ if [[ -d "$GMSGS_PREFIX" ]]; then
         fi
     done
     unset _site
+    for _libdir in \
+        "$GMSGS_PREFIX"/lib \
+        "$GMSGS_PREFIX"/local/lib
+    do
+        if [[ -d "$_libdir" ]]; then
+            case ":${LD_LIBRARY_PATH:-}:" in
+                *":${_libdir}:"*) ;;
+                *) export LD_LIBRARY_PATH="${_libdir}:${LD_LIBRARY_PATH:-}" ;;
+            esac
+        fi
+    done
+    unset _libdir
 fi
 unset GMSGS_PREFIX
 

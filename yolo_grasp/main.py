@@ -110,6 +110,19 @@ _ros_thread: Optional[threading.Thread] = None
 _ros_stop_evt = threading.Event()
 _grasps_pub = None       # /graspnet/grasps publisher
 
+# Synchronization between init() and _ros_thread_main:
+#   - _ros_ready_evt is set exactly once after the rclpy node has
+#     successfully created all of its publishers / subscribers /
+#     services, OR immediately after a setup-time exception is caught.
+#   - _ros_thread_error holds the exception (if any) so init() can
+#     propagate it to atlas as Err(...). Without this fail-fast path,
+#     a thread crash inside create_publisher (e.g. typesupport .so
+#     missing → "type_support is null") leaves the package looking
+#     ACTIVE on atlas while none of the ROS surfaces are actually up.
+_ros_ready_evt = threading.Event()
+_ros_thread_error: Optional[BaseException] = None
+_ROS_READY_TIMEOUT_S = 15.0
+
 # Latest depth + camera_info (subscribers update these from the rclpy
 # thread; readers — service handlers + auto-publish callback — read
 # under _state_lock). Both are raw ROS messages, decoded lazily.
@@ -316,90 +329,134 @@ def _compute_grasp(
 
 # ── ROS bring-up (background thread) ────────────────────────────────────────
 def _ros_thread_main() -> None:
+    """Body of the rclpy background thread.
+
+    Setup phase wrapped in try/except: any failure (typesupport .so
+    not loadable, intra-thread import error, rclpy.init failure,
+    etc.) is captured into _ros_thread_error so init() can return
+    Err(...) instead of falsely reporting Ok and leaving us "ACTIVE
+    but mute" on atlas. _ros_ready_evt is set in BOTH the success
+    and failure paths so init()'s wait() always returns within
+    _ROS_READY_TIMEOUT_S (or sooner).
+    """
     global _ros_node, _grasps_pub, _detect_client
     global _latest_depth_msg, _latest_cam_info
+    global _ros_thread_error
 
-    import rclpy                                              # noqa: E402
-    from rclpy.node import Node                               # noqa: E402
-    from sensor_msgs.msg import Image, CameraInfo             # noqa: E402
-    from graspnet_msgs.srv import GraspRequest                # noqa: E402
-    from graspnet_msgs.srv import ObjectDetectionRequest      # noqa: E402
-    from graspnet_msgs.msg import GraspPose as RosGraspPose   # noqa: E402
-    from graspnet_msgs.msg import DetectedObjects             # noqa: E402
-    from cv_bridge import CvBridge                            # noqa: E402
+    node = None
+    try:
+        import rclpy                                              # noqa: E402
+        from rclpy.node import Node                               # noqa: E402
+        from sensor_msgs.msg import Image, CameraInfo             # noqa: E402
+        from graspnet_msgs.srv import GraspRequest                # noqa: E402
+        from graspnet_msgs.srv import ObjectDetectionRequest      # noqa: E402
+        from graspnet_msgs.msg import GraspPose as RosGraspPose   # noqa: E402
+        from graspnet_msgs.msg import DetectedObjects             # noqa: E402
+        from cv_bridge import CvBridge                            # noqa: E402
 
-    # cv_bridge instance attached to the helper for cheap reuse
-    _depth_to_numpy._bridge = CvBridge()  # type: ignore[attr-defined]
+        # cv_bridge instance attached to the helper for cheap reuse
+        _depth_to_numpy._bridge = CvBridge()  # type: ignore[attr-defined]
 
-    rclpy.init(args=None)
-    node = Node("yolo_grasp_node")
-    _ros_node = node
+        rclpy.init(args=None)
+        node = Node("yolo_grasp_node")
+        _ros_node = node
 
-    cfg = _resolved_cfg
+        cfg = _resolved_cfg
 
-    depth_topic    = str(cfg.get("depth_topic",          "/camera/depth/image_raw"))
-    cam_info_topic = str(cfg.get("camera_info_topic",    "/camera/depth/camera_info"))
-    det_topic      = str(cfg.get("detect_objects_topic", "/yolo/detect_objects"))
-    grasps_topic   = str(cfg.get("grasps_topic",         "/graspnet/grasps"))
+        depth_topic    = str(cfg.get("depth_topic",          "/camera/depth/image_raw"))
+        cam_info_topic = str(cfg.get("camera_info_topic",    "/camera/depth/camera_info"))
+        det_topic      = str(cfg.get("detect_objects_topic", "/yolo/detect_objects"))
+        grasps_topic   = str(cfg.get("grasps_topic",         "/graspnet/grasps"))
 
-    # Subscribers — feed the latest depth / camera_info into shared
-    # state. We deliberately keep only the most recent message; older
-    # ones are dropped because grasp_request is always "use what's
-    # current right now". qos depth=10 mirrors upstream.
-    def _on_depth(msg):
-        global _latest_depth_msg
-        with _state_lock:
-            _latest_depth_msg = msg
+        # Subscribers — feed the latest depth / camera_info into shared
+        # state. We deliberately keep only the most recent message; older
+        # ones are dropped because grasp_request is always "use what's
+        # current right now". qos depth=10 mirrors upstream.
+        def _on_depth(msg):
+            global _latest_depth_msg
+            with _state_lock:
+                _latest_depth_msg = msg
 
-    def _on_cam_info(msg):
-        global _latest_cam_info
-        with _state_lock:
-            _latest_cam_info = msg
+        def _on_cam_info(msg):
+            global _latest_cam_info
+            with _state_lock:
+                _latest_cam_info = msg
 
-    node.create_subscription(Image,      depth_topic,    _on_depth,    10)
-    node.create_subscription(CameraInfo, cam_info_topic, _on_cam_info, 10)
-    log.info("subscribing depth=%s camera_info=%s", depth_topic, cam_info_topic)
+        node.create_subscription(Image,      depth_topic,    _on_depth,    10)
+        node.create_subscription(CameraInfo, cam_info_topic, _on_cam_info, 10)
+        log.info("subscribing depth=%s camera_info=%s", depth_topic, cam_info_topic)
 
-    # Publisher — C++ piper_moveit_control + every other downstream.
-    _grasps_pub = node.create_publisher(RosGraspPose, grasps_topic, 10)
-    log.info("publishing grasps=%s", grasps_topic)
+        # Publisher — C++ piper_moveit_control + every other downstream.
+        _grasps_pub = node.create_publisher(RosGraspPose, grasps_topic, 10)
+        log.info("publishing grasps=%s", grasps_topic)
 
-    # /yolo/detect_object client — only used when caller didn't supply
-    # a bbox (so we ask yolo_world for one). Don't block on its
-    # availability; if it's not up and someone calls grasp_request
-    # without a bbox, _serve_grasp_request will say so.
-    _detect_client = node.create_client(
-        ObjectDetectionRequest, "/yolo/detect_object")
+        # /yolo/detect_object client — only used when caller didn't supply
+        # a bbox (so we ask yolo_world for one). Don't block on its
+        # availability; if it's not up and someone calls grasp_request
+        # without a bbox, _serve_grasp_request will say so.
+        _detect_client = node.create_client(
+            ObjectDetectionRequest, "/yolo/detect_object")
 
-    # /graspnet/grasp_request service host (legacy compat).
-    def _grasp_request_cb(req, resp):
-        result = _serve_grasp_request(
-            object_name      = req.object_name,
-            bbox_2d          = list(req.bbox_2d) if req.bbox_2d else [],
-            object_center_3d = list(req.object_center_3d) if req.object_center_3d else [],
-            retry            = int(req.retry),
-        )
-        _pack_response_and_publish(resp, result, also_publish=False)
-        return resp
-    node.create_service(GraspRequest, "/graspnet/grasp_request", _grasp_request_cb)
-    log.info("ROS service up: /graspnet/grasp_request")
+        # /graspnet/grasp_request service host (legacy compat).
+        def _grasp_request_cb(req, resp):
+            result = _serve_grasp_request(
+                object_name      = req.object_name,
+                bbox_2d          = list(req.bbox_2d) if req.bbox_2d else [],
+                object_center_3d = list(req.object_center_3d) if req.object_center_3d else [],
+                retry            = int(req.retry),
+            )
+            _pack_response_and_publish(resp, result, also_publish=False)
+            return resp
+        node.create_service(GraspRequest, "/graspnet/grasp_request", _grasp_request_cb)
+        log.info("ROS service up: /graspnet/grasp_request")
 
-    # Optional auto-publish: subscribe to /yolo/detect_objects and
-    # publish grasps for matches against `candidates`.
-    auto_publish = bool(cfg.get("auto_publish_topic", True))
-    candidates   = list(cfg.get("candidates") or _DEFAULT_CANDIDATES)
-    if auto_publish:
-        log.info("auto_publish_topic ON — subscribing %s, candidates=%d",
-                 det_topic, len(candidates))
-        node.create_subscription(
-            DetectedObjects, det_topic,
-            lambda m: _on_detected_objects(m, candidates), 10)
-    else:
-        log.info("auto_publish_topic OFF — service mode only")
+        # Optional auto-publish: subscribe to /yolo/detect_objects and
+        # publish grasps for matches against `candidates`.
+        auto_publish = bool(cfg.get("auto_publish_topic", True))
+        candidates   = list(cfg.get("candidates") or _DEFAULT_CANDIDATES)
+        if auto_publish:
+            log.info("auto_publish_topic ON — subscribing %s, candidates=%d",
+                     det_topic, len(candidates))
+            node.create_subscription(
+                DetectedObjects, det_topic,
+                lambda m: _on_detected_objects(m, candidates), 10)
+        else:
+            log.info("auto_publish_topic OFF — service mode only")
+    except BaseException as e:  # noqa: BLE001 — must include SystemExit/KeyboardInterrupt etc.
+        # Setup-time failure. Most common cause in practice: graspnet_msgs
+        # typesupport .so files not on LD_LIBRARY_PATH, so create_publisher
+        # raises "type_support is null". Capture and signal init().
+        _ros_thread_error = e
+        log.error("rclpy thread setup failed: %s: %s",
+                  type(e).__name__, e, exc_info=True)
+        # Best-effort cleanup so re-init has a clean slate.
+        try:
+            if node is not None:
+                node.destroy_node()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            import rclpy as _rclpy_for_shutdown
+            if _rclpy_for_shutdown.ok():
+                _rclpy_for_shutdown.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        _ros_ready_evt.set()
+        return
+
+    # Setup OK — let init() proceed.
+    _ros_ready_evt.set()
 
     # Spin until shutdown.
+    import rclpy  # noqa: E402  (re-import for the spin loop scope)
     while not _ros_stop_evt.is_set():
-        rclpy.spin_once(node, timeout_sec=0.1)
+        try:
+            rclpy.spin_once(node, timeout_sec=0.1)
+        except Exception as e:  # noqa: BLE001
+            # Per-iteration errors should NOT bring the whole thread down
+            # — that would silently re-introduce the "alive but mute"
+            # failure mode. Log and continue.
+            log.warning("rclpy.spin_once raised: %s", e)
 
     # Graceful shutdown: emit a zero-pose so subscribers know we're
     # gone (upstream does this; piper_moveit_control treats zero as
@@ -407,16 +464,24 @@ def _ros_thread_main() -> None:
     # the middle of rclpy teardown.
     try:
         if _grasps_pub is not None:
+            from graspnet_msgs.msg import GraspPose as RosGraspPose  # noqa: E402
             zero = RosGraspPose()
-            _fill_zero_grasp(zero, frame_id=str(cfg.get("output_frame",
+            _fill_zero_grasp(zero, frame_id=str(_resolved_cfg.get("output_frame",
                                                        "camera_color_optical_frame")))
             _grasps_pub.publish(zero)
-            log.info("published shutdown zero-pose to %s", grasps_topic)
+            log.info("published shutdown zero-pose to %s",
+                     _resolved_cfg.get("grasps_topic", "/graspnet/grasps"))
     except Exception as e:  # noqa: BLE001
         log.warning("shutdown zero-pose publish failed: %s", e)
 
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        node.destroy_node()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        rclpy.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
     log.info("rclpy thread exited")
 
 
@@ -633,18 +698,46 @@ def init(cfg):
     # Informational: log which provider owns detect_object on atlas.
     _resolve_detect_object_endpoint()
 
-    # Spawn rclpy thread. on_init returning Ok() triggers atlas to
-    # mark us ACTIVE; the thread itself is what advertises the
-    # service / topic.
-    global _ros_thread
+    # Spawn rclpy thread. We then BLOCK on _ros_ready_evt — the thread
+    # signals it after either successful setup of every publisher /
+    # subscriber / service, OR a setup-time exception (captured into
+    # _ros_thread_error). This makes init() fail-fast and propagate
+    # the error to atlas via Err(...), instead of returning Ok and
+    # leaving us "ACTIVE but mute" (the typesupport.so / LD_LIBRARY_PATH
+    # failure mode that was previously silent).
+    global _ros_thread, _ros_thread_error
     _ros_stop_evt.clear()
+    _ros_ready_evt.clear()
+    _ros_thread_error = None
     _ros_thread = threading.Thread(
         target=_ros_thread_main,
         name="yolo_grasp-ros",
         daemon=True,
     )
     _ros_thread.start()
-    time.sleep(0.5)  # let create_service / create_publisher land
+
+    if not _ros_ready_evt.wait(timeout=_ROS_READY_TIMEOUT_S):
+        # Thread is hung somewhere in setup — try to bring it down so
+        # a retry has a clean slate, then surface a clear error.
+        _ros_stop_evt.set()
+        _ros_thread.join(timeout=2.0)
+        return Err(
+            f"rclpy thread did not become ready within "
+            f"{_ROS_READY_TIMEOUT_S}s (likely blocked in rclpy.init or "
+            f"create_publisher; check `ps -T` and the log just above)"
+        )
+
+    if _ros_thread_error is not None:
+        # Setup-time exception. Most common: typesupport .so missing.
+        err = _ros_thread_error
+        _ros_stop_evt.set()
+        _ros_thread.join(timeout=2.0)
+        return Err(
+            f"rclpy thread setup failed: {type(err).__name__}: {err} — "
+            f"if message mentions 'libgraspnet_msgs__rosidl_typesupport_*.so', "
+            f"the vendored graspnet_msgs lib/ is not on LD_LIBRARY_PATH "
+            f"(check scripts/start.sh's graspnet_msgs path injection)"
+        )
 
     with _state_lock:
         _initialized = True
