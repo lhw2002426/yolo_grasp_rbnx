@@ -33,8 +33,9 @@ Three surfaces, sharing one ``_compute_grasp()`` math kernel:
        + /graspnet/grasps topic  (graspnet_msgs/msg/GraspPose)
 
   3. **Auto-publish stream mode** (matches upstream yolo_grasp.py
-     behaviour). When ``cfg.auto_publish_topic`` is true (default),
-     subscribe to ``cfg.detect_objects_topic`` (default
+     behaviour). When ``cfg.auto_publish_topic`` is true (DEFAULT
+     OFF — see safety note below), subscribe to
+     ``cfg.detect_objects_topic`` (default
      ``/yolo/detect_objects``, the legacy YOLOE publisher), and
      for every incoming ``DetectedObjects`` message:
        * pick the first detection whose ``object_name`` is in
@@ -44,6 +45,19 @@ Three surfaces, sharing one ``_compute_grasp()`` math kernel:
          ``/graspnet/grasps`` — fire-and-forget.
      This is what makes the legacy yolo_world → yolo_grasp →
      piper_moveit_control pipeline work without any caller code.
+
+     **Safety note (default OFF)**: the downstream cpp
+     ``moveit_control_node_yolo`` triggers a full grasp on the FIRST
+     ``/graspnet/grasps`` it sees while idle, then locks itself
+     ``is_busy_=true`` until ``/moveit_control/reset`` is called. If
+     auto-publish is left ON, the moment the cpp node enters idle
+     (e.g. right after a reset), the next 1Hz tick will start a NEW
+     grasp without any caller asking for one. That is unsafe and
+     surprising. So this mode is OFF by default; flip
+     ``auto_publish_topic: true`` in the deploy manifest only when
+     you really want the "any detected object → autograsp" demo
+     behaviour and you understand who else is publishing /
+     subscribing.
 
 Lifecycle (per Robonix developer guide §5):
     on_init         — parse cfg, atlas-resolve detect_object endpoint
@@ -398,6 +412,15 @@ def _ros_thread_main() -> None:
             ObjectDetectionRequest, "/yolo/detect_object")
 
         # /graspnet/grasp_request service host (legacy compat).
+        #
+        # also_publish=True: a ROS-service grasp_request is the caller
+        # explicitly saying "compute AND have the executor act on it"
+        # (same as the MCP path). Filling the response gives the caller
+        # the pose for their own bookkeeping; publishing the same pose
+        # to /graspnet/grasps wakes the cpp moveit_control_node_yolo
+        # subscriber. With auto_publish_topic OFF by default, this is
+        # the ONLY path that triggers the cpp node, which is exactly
+        # what we want — caller-driven, one-shot.
         def _grasp_request_cb(req, resp):
             result = _serve_grasp_request(
                 object_name      = req.object_name,
@@ -405,23 +428,33 @@ def _ros_thread_main() -> None:
                 object_center_3d = list(req.object_center_3d) if req.object_center_3d else [],
                 retry            = int(req.retry),
             )
-            _pack_response_and_publish(resp, result, also_publish=False)
+            _pack_response_and_publish(resp, result, also_publish=True)
             return resp
         node.create_service(GraspRequest, "/graspnet/grasp_request", _grasp_request_cb)
         log.info("ROS service up: /graspnet/grasp_request")
 
         # Optional auto-publish: subscribe to /yolo/detect_objects and
         # publish grasps for matches against `candidates`.
-        auto_publish = bool(cfg.get("auto_publish_topic", True))
+        # DEFAULT OFF — see file header "Safety note" for why.
+        auto_publish = bool(cfg.get("auto_publish_topic", False))
         candidates   = list(cfg.get("candidates") or _DEFAULT_CANDIDATES)
         if auto_publish:
-            log.info("auto_publish_topic ON — subscribing %s, candidates=%d",
+            log.warning(
+                "auto_publish_topic ON — yolo_grasp will publish a fresh "
+                "grasp pose to /graspnet/grasps for every detected object "
+                "matching candidates (%d). The cpp moveit_control_node_yolo "
+                "will trigger a real arm motion on the FIRST such message "
+                "while it is idle. Only safe if you know what you're doing.",
+                len(candidates))
+            log.info("subscribing %s, candidates=%d",
                      det_topic, len(candidates))
             node.create_subscription(
                 DetectedObjects, det_topic,
                 lambda m: _on_detected_objects(m, candidates), 10)
         else:
-            log.info("auto_publish_topic OFF — service mode only")
+            log.info("auto_publish_topic OFF — service / MCP mode only "
+                     "(safe default; flip cfg.auto_publish_topic=true to "
+                     "stream grasps from detect_objects)")
     except BaseException as e:  # noqa: BLE001 — must include SystemExit/KeyboardInterrupt etc.
         # Setup-time failure. Most common cause in practice: graspnet_msgs
         # typesupport .so files not on LD_LIBRARY_PATH, so create_publisher
@@ -692,7 +725,7 @@ def init(cfg):
     _resolved_cfg = cfg
 
     log.info("cfg: %d keys (auto_publish=%s, candidates=%d)",
-             len(cfg), cfg.get("auto_publish_topic", True),
+             len(cfg), cfg.get("auto_publish_topic", False),
              len(cfg.get("candidates") or _DEFAULT_CANDIDATES))
 
     # Informational: log which provider owns detect_object on atlas.

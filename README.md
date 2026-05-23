@@ -126,7 +126,7 @@ without any extra plumbing.
 Stage 6 pick_skill to decide whether to retry. Upstream doesn't
 expose a per-grasp score; this is a Stage 4B-only addition.
 
-## Auto-publish stream mode (default ON)
+## Auto-publish stream mode (default OFF — safety)
 
 Independent of the `grasp_request` RPC surfaces, the package can also
 run in "stream mode" — exactly what upstream `yolo_grasp.py` did:
@@ -142,26 +142,47 @@ yolo_grasp subscribes; for each detection whose object_name is in
 piper_moveit_control C++ subscriber receives → executes
 ```
 
-This makes the legacy yolo_world → yolo_grasp → piper_moveit_control
-pipeline end-to-end without any caller code at all. Disable with:
+This is the legacy yolo_world → yolo_grasp → piper_moveit_control
+pipeline running end-to-end without any caller code at all.
+
+**It is OFF by default.** The cpp `moveit_control_node_yolo`
+triggers a real arm motion on the FIRST `/graspnet/grasps` message
+it sees while idle. With auto-publish ON, the moment the cpp node
+returns to idle (e.g. right after `/moveit_control/reset`), the
+NEXT 1Hz tick from the auto-publish stream will start an
+unsolicited grasp. That is exactly the kind of surprise we don't
+want for a hardware deploy. Enable explicitly only when you want
+the legacy demo behaviour:
 
 ```yaml
 config:
-  auto_publish_topic: false
+  auto_publish_topic: true
 ```
 
 The candidates allowlist defaults to the upstream list (15 prompt-free
 YOLOE class names: `bookmark`, `lamp`, `paper`, `document`, …); replace
 via `cfg.candidates` to scope to your scene.
 
+## How callers should trigger a grasp
+
+With `auto_publish_topic` defaulting to false, exactly two paths
+trigger the cpp executor:
+
+| Caller surface | What it does |
+|---|---|
+| ROS service `/graspnet/grasp_request` (`graspnet_msgs/srv/GraspRequest`) | Computes a grasp, fills the response, AND publishes the same pose to `/graspnet/grasps` so the cpp node executes it. |
+| MCP `robonix/service/perception/grasp_pose/grasp_request` (Pilot / pick_skill path) | Same: response + topic publish. |
+
+Both are one-shot — one call ⇒ at most one grasp. No background stream.
+
 ## Configuration
 
-All keys are optional. Defaults match upstream `yolo_grasp.py`.
+All keys are optional. Defaults are listed in the comment after each.
 
 ```yaml
 config:
-  # Auto-publish stream (upstream behaviour) ─────────────────────
-  auto_publish_topic: true                # default true
+  # Auto-publish stream (legacy upstream behaviour) ──────────────
+  auto_publish_topic: false               # default false; see above
   auto_publish_min_interval_s: 0.0        # 0 = no rate limit
   candidates:                             # detection allowlist
     - bookmark

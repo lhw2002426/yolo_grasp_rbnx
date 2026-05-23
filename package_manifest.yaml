@@ -13,10 +13,11 @@
 # Plus a fourth, "auto-publish" mode (default ON): subscribe to the
 # legacy /yolo/detect_objects topic, and for every detection whose
 # object_name is in `cfg.candidates`, compute a grasp + publish to
-# /graspnet/grasps. This is what makes the existing yolo_world →
-# yolo_grasp → piper_moveit_control pipeline work end-to-end without
-# any caller code, exactly like the upstream yolo_grasp.py did. Set
-# auto_publish_topic=false to disable.
+# /graspnet/grasps. This is the upstream "stream demo" behaviour —
+# OFF BY DEFAULT in this package because the cpp executor triggers a
+# real arm motion on the FIRST /graspnet/grasps it sees while idle,
+# which is dangerous when no caller asked for a grasp. Set
+# auto_publish_topic=true to opt-in to the legacy stream demo.
 #
 # Lifecycle:
 #   on_init      — light-medium: parse cfg, atlas-resolve detect_object
@@ -37,8 +38,10 @@
 #   candidates                  list[str]   default = upstream allowlist of
 #                                            ~15 prompt-free YOLOE class names
 #                                            (bookmark / lamp / paper / etc.)
-#   auto_publish_topic          bool        default true  — subscribe to
-#                                            detect_objects_topic
+#   auto_publish_topic          bool        DEFAULT FALSE — opt-in only.
+#                                            true → subscribe to
+#                                            detect_objects_topic and stream
+#                                            grasps for every match.
 #   auto_publish_min_interval_s float       default 0.0   — rate limit (s).
 #                                            0 means publish every detection.
 #
