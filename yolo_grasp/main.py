@@ -143,12 +143,23 @@ _ROS_READY_TIMEOUT_S = 15.0
 _latest_depth_msg = None         # sensor_msgs/Image
 _latest_cam_info = None          # sensor_msgs/CameraInfo
 
+# Latest /yolo/detect_objects message — cached unconditionally (i.e.
+# even when auto_publish_topic is OFF) so that grasp_request handlers
+# can resolve a bbox from object_name without making a blocking ROS
+# service call to /yolo/detect_object.
+#
+# Why cache instead of calling /yolo/detect_object: the ROS service
+# call from inside our own ROS service handler self-deadlocks. Both
+# handlers run in the same single-threaded rclpy executor, so while
+# our handler awaits the future, no spin can happen, and the response
+# never gets routed through. Result: 5s timeout. Subscribing to the
+# 1Hz broadcast that yolo_world emits anyway side-steps that entirely
+# (a 1Hz cache is plenty fresh for anything a caller would do).
+_latest_detected_objects = None  # graspnet_msgs/msg/DetectedObjects
+_latest_detected_objects_stamp_s: float = 0.0
+
 # auto-publish rate limit
 _last_auto_publish_time = 0.0
-
-# /yolo/detect_object client (used when MCP / ROS service caller
-# didn't supply a bbox themselves)
-_detect_client = None
 
 
 # ── atlas: resolve upstream detect_object (informational) ───────────────────
@@ -353,7 +364,7 @@ def _ros_thread_main() -> None:
     and failure paths so init()'s wait() always returns within
     _ROS_READY_TIMEOUT_S (or sooner).
     """
-    global _ros_node, _grasps_pub, _detect_client
+    global _ros_node, _grasps_pub
     global _latest_depth_msg, _latest_cam_info
     global _ros_thread_error
 
@@ -363,7 +374,6 @@ def _ros_thread_main() -> None:
         from rclpy.node import Node                               # noqa: E402
         from sensor_msgs.msg import Image, CameraInfo             # noqa: E402
         from graspnet_msgs.srv import GraspRequest                # noqa: E402
-        from graspnet_msgs.srv import ObjectDetectionRequest      # noqa: E402
         from graspnet_msgs.msg import GraspPose as RosGraspPose   # noqa: E402
         from graspnet_msgs.msg import DetectedObjects             # noqa: E402
         from cv_bridge import CvBridge                            # noqa: E402
@@ -404,12 +414,39 @@ def _ros_thread_main() -> None:
         _grasps_pub = node.create_publisher(RosGraspPose, grasps_topic, 10)
         log.info("publishing grasps=%s", grasps_topic)
 
-        # /yolo/detect_object client — only used when caller didn't supply
-        # a bbox (so we ask yolo_world for one). Don't block on its
-        # availability; if it's not up and someone calls grasp_request
-        # without a bbox, _serve_grasp_request will say so.
-        _detect_client = node.create_client(
-            ObjectDetectionRequest, "/yolo/detect_object")
+        # /yolo/detect_objects subscription — ALWAYS ON. Two reasons:
+        #
+        #   (a) caller-driven path: when /graspnet/grasp_request or
+        #       MCP grasp_request comes in WITHOUT a bbox, we used to
+        #       call yolo_world's /yolo/detect_object ROS service to
+        #       get one. That self-deadlocks: the rclpy executor is
+        #       single-threaded, so awaiting the future blocks the
+        #       same thread that would route the response, and the
+        #       call always times out at 5s. Subscribing to the 1Hz
+        #       broadcast yolo_world emits anyway gives us the same
+        #       data without any RPC.
+        #
+        #   (b) optional auto_publish path: same data feeds the
+        #       lambda below when auto_publish_topic=true.
+        #
+        # cb fan-out: the subscription cb writes to the cache
+        # unconditionally, then conditionally calls the
+        # auto-publish handler.
+        candidates   = list(cfg.get("candidates") or _DEFAULT_CANDIDATES)
+        auto_publish = bool(cfg.get("auto_publish_topic", False))
+
+        def _on_detect_objects_msg(msg):
+            global _latest_detected_objects, _latest_detected_objects_stamp_s
+            with _state_lock:
+                _latest_detected_objects = msg
+                _latest_detected_objects_stamp_s = time.monotonic()
+            if auto_publish:
+                _on_detected_objects(msg, candidates)
+
+        node.create_subscription(
+            DetectedObjects, det_topic, _on_detect_objects_msg, 10)
+        log.info("subscribing detect_objects=%s (cache always on; "
+                 "auto_publish=%s)", det_topic, auto_publish)
 
         # /graspnet/grasp_request service host (legacy compat).
         #
@@ -433,11 +470,9 @@ def _ros_thread_main() -> None:
         node.create_service(GraspRequest, "/graspnet/grasp_request", _grasp_request_cb)
         log.info("ROS service up: /graspnet/grasp_request")
 
-        # Optional auto-publish: subscribe to /yolo/detect_objects and
-        # publish grasps for matches against `candidates`.
+        # Auto-publish bookkeeping log only — the actual subscription
+        # is the same one we created above.
         # DEFAULT OFF — see file header "Safety note" for why.
-        auto_publish = bool(cfg.get("auto_publish_topic", False))
-        candidates   = list(cfg.get("candidates") or _DEFAULT_CANDIDATES)
         if auto_publish:
             log.warning(
                 "auto_publish_topic ON — yolo_grasp will publish a fresh "
@@ -446,11 +481,6 @@ def _ros_thread_main() -> None:
                 "will trigger a real arm motion on the FIRST such message "
                 "while it is idle. Only safe if you know what you're doing.",
                 len(candidates))
-            log.info("subscribing %s, candidates=%d",
-                     det_topic, len(candidates))
-            node.create_subscription(
-                DetectedObjects, det_topic,
-                lambda m: _on_detected_objects(m, candidates), 10)
         else:
             log.info("auto_publish_topic OFF — service / MCP mode only "
                      "(safe default; flip cfg.auto_publish_topic=true to "
@@ -638,35 +668,75 @@ def _publish_to_grasps_topic(result: dict) -> None:
         log.warning("/graspnet/grasps publish failed: %s", e)
 
 
-def _call_detect_object(object_name: str, timeout_s: float = 5.0) -> dict:
-    """Synchronous client call to /yolo/detect_object (legacy path
-    owned by yolo_world_rbnx). Used when caller didn't supply bbox."""
-    from graspnet_msgs.srv import ObjectDetectionRequest  # noqa: E402
-    if _detect_client is None:
+def _call_detect_object(object_name: str, *, max_age_s: float = 3.0) -> dict:
+    """Resolve a bbox for ``object_name`` from the cached
+    ``/yolo/detect_objects`` broadcast.
+
+    Why not call yolo_world's /yolo/detect_object ROS service directly:
+    that self-deadlocks when invoked from inside our own ROS service
+    handler. Both run in the same single-threaded rclpy executor on
+    this node, so awaiting the future blocks the very thread that
+    would route the response. Result: 5s timeout every time.
+
+    The cache is fed unconditionally by the /yolo/detect_objects
+    subscription created in _ros_thread_main, regardless of whether
+    auto_publish_topic is enabled. yolo_world publishes that topic at
+    1Hz in its periodic broadcast (see yolo_world.main._periodic_broadcast),
+    which is more than fresh enough for any caller that's about to ask
+    for a grasp.
+
+    Match rule mirrors yolo_world._detect_object: case-insensitive
+    substring on object_name vs detected name (either direction). We
+    return the highest-confidence match.
+    """
+    with _state_lock:
+        msg = _latest_detected_objects
+        stamp_s = _latest_detected_objects_stamp_s
+
+    if msg is None:
         return {"success": False,
-                "message": "ROS thread not initialized",
+                "message": "no /yolo/detect_objects message received yet "
+                           "(is yolo_world up and publishing?)",
                 "bbox_2d": [], "object_center_3d": [], "confidence": 0.0}
-    if not _detect_client.service_is_ready():
+
+    age_s = time.monotonic() - stamp_s
+    if age_s > max_age_s:
         return {"success": False,
-                "message": "/yolo/detect_object service not advertised",
+                "message": f"/yolo/detect_objects cache stale ({age_s:.1f}s old)",
                 "bbox_2d": [], "object_center_3d": [], "confidence": 0.0}
-    req = ObjectDetectionRequest.Request()
-    req.object_name = object_name
-    fut = _detect_client.call_async(req)
-    deadline = time.monotonic() + timeout_s
-    while not fut.done() and time.monotonic() < deadline:
-        time.sleep(0.05)
-    if not fut.done():
+
+    if not msg.objects:
         return {"success": False,
-                "message": f"/yolo/detect_object call timed out after {timeout_s}s",
+                "message": "/yolo/detect_objects has 0 detections in latest frame",
                 "bbox_2d": [], "object_center_3d": [], "confidence": 0.0}
-    resp = fut.result()
+
+    name_lower = object_name.lower().strip()
+    best = None  # (confidence, det_obj)
+    for det in msg.objects:
+        det_name = (det.object_name or "").lower().strip()
+        if not det_name:
+            continue
+        if (name_lower == det_name or name_lower in det_name
+                or det_name in name_lower):
+            conf = float(getattr(det, "confidence", 0.0))
+            if best is None or conf > best[0]:
+                best = (conf, det)
+
+    if best is None:
+        seen = ", ".join(o.object_name for o in msg.objects[:8])
+        return {"success": False,
+                "message": (f"object {object_name!r} not in latest "
+                            f"/yolo/detect_objects (saw: {seen}…)"),
+                "bbox_2d": [], "object_center_3d": [], "confidence": 0.0}
+
+    conf, det = best
     return {
-        "success":          bool(resp.success),
-        "message":          str(resp.message),
-        "bbox_2d":          list(resp.bbox_2d),
-        "object_center_3d": list(resp.object_center_3d),
-        "confidence":       float(resp.confidence),
+        "success":          True,
+        "message":          (f"resolved from /yolo/detect_objects cache "
+                             f"(age={age_s:.2f}s, conf={conf:.3f})"),
+        "bbox_2d":          list(det.bbox_2d),
+        "object_center_3d": list(det.object_center_3d) if det.object_center_3d else [],
+        "confidence":       conf,
     }
 
 
